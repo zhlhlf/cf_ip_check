@@ -45,7 +45,7 @@ jobs:
                 goos=$(echo "$target" | cut -d/ -f1)
                 goarch=$(echo "$target" | cut -d/ -f2)
                 ext=$(echo "$target" | cut -d/ -f3)
-                name="cfip-${goos}-${goarch}-${VERSION}${ext}"
+                name="cfip-${goos}-${goarch}${ext}"
                 echo "Building $name"
                 CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
                   -buildvcs=false \
