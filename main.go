@@ -119,7 +119,7 @@ func main() {
 
 	fmt.Print("\n优选结果\n\n")
 	for i := 0; i < count; i++ {
-		fmt.Printf("%s:%d# %.0fms\n", successes[i].ip, successes[i].port, float64(successes[i].delay.Microseconds())/1000)
+		fmt.Printf("%s\t%d\t%.0fms\n", successes[i].ip, successes[i].port, float64(successes[i].delay.Microseconds())/1000)
 	}
 
 	if opts.changeFile {
