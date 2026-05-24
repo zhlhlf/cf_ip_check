@@ -25,7 +25,7 @@ const (
 	maxLineLen = 16384
 
 	defaultPort    = 2096
-	defaultCount   = 16
+	defaultCount   = 32
 	defaultSamples = 512
 	defaultThreads = 50
 	defaultTimeout = 2 * time.Second
@@ -123,7 +123,7 @@ func main() {
 	}
 
 	if opts.changeFile {
-		bestCount := min(len(successes), 16)
+		bestCount := min(len(successes), defaultCount)
 		nodes := make([]bestNode, bestCount)
 		for i := 0; i < bestCount; i++ {
 			nodes[i] = bestNode{ip: successes[i].ip}
@@ -418,9 +418,9 @@ func updateConfigYAML(filename string, nodes []bestNode, opts options) (int, err
 	lines := strings.SplitAfter(string(data), "\n")
 	replaced := 0
 	for i := range lines {
-		for n := 0; n < len(nodes) && n < 16; n++ {
+		for n := len(nodes) - 1; n >= 0; n-- {
 			namePattern := fmt.Sprintf("name: CF官方优选%d", n+1)
-			if strings.Contains(lines[i], namePattern) {
+			if containsCFPreferredName(lines[i], n+1) {
 				lines[i] = replaceServerPortPasswordSNI(lines[i], nodes[n].ip, opts)
 				replaced++
 				fmt.Printf("已更新 %s -> %s", namePattern, nodes[n].ip)
@@ -439,6 +439,26 @@ func updateConfigYAML(filename string, nodes []bestNode, opts options) (int, err
 
 	fmt.Printf("%s 更新完成，共替换 %d 项\n", filename, replaced)
 	return replaced, nil
+}
+
+func containsCFPreferredName(line string, index int) bool {
+	name := fmt.Sprintf("CF官方优选%d", index)
+	pos := strings.Index(line, name)
+	if pos < 0 {
+		return false
+	}
+
+	before := line[:pos]
+	if !strings.Contains(before, "name:") {
+		return false
+	}
+
+	afterPos := pos + len(name)
+	if afterPos >= len(line) {
+		return true
+	}
+	next := line[afterPos]
+	return next < '0' || next > '9'
 }
 
 func replaceServerPortPasswordSNI(line, newIP string, opts options) string {

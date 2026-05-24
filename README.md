@@ -6,8 +6,8 @@ Go 版 Cloudflare IP 优选工具，迁移自 `a.c`。
 
 - 拉取 Cloudflare CIDR 列表，失败时使用内置备用网段。
 - 随机抽样候选 IP，并发 TCP 连接测试延迟。
-- 输出最快的 16 个结果。
-- 可选更新 mihomo/clash 配置中 `CF官方优选1` 到 `CF官方优选16` 的 `server`、`port`、`password`、`sni`、`Host`。
+- 输出最快的 32 个结果。
+- 可选更新 mihomo/clash 配置中 `CF官方优选1` 到 `CF官方优选32` 的 `server`、`port`、`password`、`sni`、`Host`。
 
 ## 使用
 
