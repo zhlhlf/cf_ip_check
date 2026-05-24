@@ -1,4 +1,4 @@
-name: Windows Release
+name: Release
 
 on:
   push:
@@ -11,40 +11,55 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Set release version
         id: vars
-        shell: pwsh
         run: |
-          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
-          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+          short_sha="${GITHUB_SHA::8}"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Build Windows binary
-        shell: pwsh
+      - name: Build cross-platform binaries in Docker
         run: |
-          $shortSha = "${{ steps.vars.outputs.short_sha }}"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          go build -trimpath -ldflags "-s -w -X main.version=$shortSha" -o "dist/cfip-windows-amd64-$shortSha.exe" .
-          Compress-Archive -Path "dist/cfip-windows-amd64-$shortSha.exe" -DestinationPath "dist/cfip-windows-amd64-$shortSha.zip" -Force
+          docker run --rm \
+            -e VERSION="${{ steps.vars.outputs.short_sha }}" \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            golang:1.22-bookworm \
+            sh -c '
+              set -eu
+              mkdir -p dist
+              targets="
+                windows/amd64/.exe
+                windows/arm64/.exe
+                linux/amd64/
+                linux/arm64/
+                darwin/amd64/
+                darwin/arm64/
+              "
+              for target in $targets; do
+                goos=$(echo "$target" | cut -d/ -f1)
+                goarch=$(echo "$target" | cut -d/ -f2)
+                ext=$(echo "$target" | cut -d/ -f3)
+                name="cfip-${goos}-${goarch}-${VERSION}${ext}"
+                echo "Building $name"
+                CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
+                  -trimpath \
+                  -ldflags "-s -w -X main.version=${VERSION}" \
+                  -o "dist/$name" .
+              done
+            '
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: win-${{ steps.vars.outputs.short_sha }}
-          name: Windows ${{ steps.vars.outputs.short_sha }}
+          tag_name: release-${{ steps.vars.outputs.short_sha }}
+          name: Release ${{ steps.vars.outputs.short_sha }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           files: |
-            dist/cfip-windows-amd64-*.exe
-            dist/cfip-windows-amd64-*.zip
+            dist/cfip-*
