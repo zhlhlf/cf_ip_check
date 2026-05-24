@@ -1,0 +1,50 @@
+name: Windows Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set release version
+        id: vars
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows binary
+        shell: pwsh
+        run: |
+          $shortSha = "${{ steps.vars.outputs.short_sha }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags "-s -w -X main.version=$shortSha" -o "dist/cfip-windows-amd64-$shortSha.exe" .
+          Compress-Archive -Path "dist/cfip-windows-amd64-$shortSha.exe" -DestinationPath "dist/cfip-windows-amd64-$shortSha.zip" -Force
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-${{ steps.vars.outputs.short_sha }}
+          name: Windows ${{ steps.vars.outputs.short_sha }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: |
+            dist/cfip-windows-amd64-*.exe
+            dist/cfip-windows-amd64-*.zip
