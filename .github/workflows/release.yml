@@ -26,7 +26,9 @@ jobs:
       - name: Build cross-platform binaries in Docker
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
             -e VERSION="${{ steps.vars.outputs.short_sha }}" \
+            -e HOME=/tmp \
             -v "${{ github.workspace }}:/src" \
             -w /src \
             golang:1.22-bookworm \
@@ -55,9 +57,11 @@ jobs:
               done
             '
 
-      # 把配置模板和说明一起放进 dist, 下载后解压即用
       - name: Stage release assets
         run: |
+          # 容器已用 --user 身份运行, 正常情况下 dist 就属于当前用户;
+          # 兜底处理旧产物遗留的 root 权限
+          chown -R "$(id -u):$(id -g)" dist 2>/dev/null || true
           cp cf.env.example dist/cf.env.example
           cp README.md dist/README.md
           cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* cf.env.example README.md && ls -lh
