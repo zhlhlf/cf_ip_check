@@ -55,6 +55,15 @@ jobs:
               done
             '
 
+      # 把配置模板和说明一起放进 dist, 下载后解压即用
+      - name: Stage release assets
+        run: |
+          cp cf.env.example dist/cf.env.example
+          cp README.md dist/README.md
+          cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* cf.env.example README.md && ls -lh
+        env:
+          SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -62,5 +71,28 @@ jobs:
           name: Release ${{ steps.vars.outputs.short_sha }}
           target_commitish: ${{ github.sha }}
           make_latest: true
+          body: |
+            ## 使用方法
+
+            1. 下载对应平台的 `cfip-<os>-<arch>`
+            2. 复制配置模板并填写自己的节点信息:
+               ```bash
+               cp cf.env.example cf.env
+               # 编辑 cf.env, 至少填 SNI、PORT、PASSWORD、XRAY_BIN
+               ```
+            3. 运行:
+               ```bash
+               chmod +x cfip-linux-amd64
+               ./cfip-linux-amd64 -apply
+               ```
+
+            `cf.env` 含节点密码, 已在 `.gitignore` 中忽略, 请勿提交。
+
+            版本: `${{ steps.vars.outputs.short_sha }}` (`./cfip -version` 可查看)
           files: |
-            dist/cfip-*
+            dist/cfip-linux-*
+            dist/cfip-darwin-*
+            dist/cfip-windows-*
+            dist/cf.env.example
+            dist/README.md
+            dist/cfip-*.zip
