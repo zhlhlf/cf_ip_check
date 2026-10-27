@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set release version
+        id: vars
+        run: |
+          short_sha="${GITHUB_SHA::8}"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build cross-platform binaries in Docker
+        run: |
+          docker run --rm \
+            -e VERSION="${{ steps.vars.outputs.short_sha }}" \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            golang:1.22-bookworm \
+            sh -c '
+              set -eu
+              mkdir -p dist
+              targets="
+                windows/amd64/.exe
+                windows/arm64/.exe
+                linux/amd64/
+                linux/arm64/
+                darwin/amd64/
+                darwin/arm64/
+              "
+              for target in $targets; do
+                goos=$(echo "$target" | cut -d/ -f1)
+                goarch=$(echo "$target" | cut -d/ -f2)
+                ext=$(echo "$target" | cut -d/ -f3)
+                name="cfip-${goos}-${goarch}${ext}"
+                echo "Building $name"
+                CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
+                  -buildvcs=false \
+                  -trimpath \
+                  -ldflags "-s -w -X main.version=${VERSION}" \
+                  -o "dist/$name" .
+              done
+            '
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ steps.vars.outputs.short_sha }}
+          name: Release ${{ steps.vars.outputs.short_sha }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: |
+            dist/cfip-*
