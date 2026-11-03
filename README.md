@@ -4,7 +4,18 @@
 
 **所有配置都在 `cf.env` 里**，不读、也不改 xray 的 `config.json`。
 
-## 为什么改造
+## 两种模式
+
+`PASSWORD` 是模式开关，不需要额外的 flag：
+
+| PASSWORD | 模式 | 探测方式 | 能证明什么 |
+|---|---|---|---|
+| 留空（默认） | **纯 TCP** | TCP 三次握手 | 只筛掉完全不可达的 IP，零配置可跑 |
+| 填了 | **TLS+WS** | TCP → TLS1.3 → WS 101，可选隧道测速 | 真正承载该域名的 IP + 真实吞吐 |
+
+纯 TCP 模式是给"还没配好节点、只想先看看通不通"用的。它测不出质量，原因见下节。
+
+## 为什么需要 TLS+WS 模式
 
 上游工具只测 **TCP connect**（`main.go:396` 的 `tcpConnectTimeout`）。这个指标在 Cloudflare 上是无效的：
 
@@ -25,22 +36,25 @@
 
 | 阶段 | 测什么 | 能证明什么 | 需要什么 |
 |---|---|---|---|
-| 1 快筛 | WS 握手是否返回 101 | IP 是否承载该域名、接受 WS 升级 | SNI + Host + 端口 |
+| 1 快筛 | WS 握手是否返回 101 | IP 是否承载该域名、接受 WS 升级 | HOST + 端口 |
 | 2 精测 | 上述握手 × N 轮取中位数 | 同上，排序更稳 | 同上 |
 | 3 测速 | 带密码走完隧道下载 | **真实吞吐**，这才是用户体感 | 再加 PASSWORD + XRAY_BIN |
 
-> ⚠️ **101 不等于可用**。Cloudflare 全站 anycast，10000 个候选里有 8561 个能返回 101。密码或 SNI 填错时它们照样全部返回 101，但一个都用不了。只有阶段 3 能证明节点真的通。
+> ⚠️ **101 不等于可用**。Cloudflare 全站 anycast，10000 个候选里有 8561 个能返回 101。密码或 HOST 填错时它们照样全部返回 101，但一个都用不了。只有阶段 3 能证明节点真的通。
 >
 > ⚠️ **握手延迟不能用来选 IP**。它是"连上 CF 边缘"的耗时，不包含回源链路。同一 /24 内 35ms 的差距纯属网络抖动。
 
 ## 用法
 
+`cf.env.example` 已内嵌进二进制：默认路径 `cf.env` 不存在时会自动生成一份模板，
+改完再跑即可，不需要手动 `cp`。（显式指定的 `-env` 路径不存在仍会报错，避免路径写错时悄悄生成模板。）
+
 ```bash
-# 默认读当前目录的 cf.env
+# 默认读当前目录的 cf.env, 不存在则自动从内置模板生成
 ./cfip
 
-# 完整筛选 + 测速 + 把最优 IP 写回 cf.env
-./cfip -apply
+# 完整筛选 + 测速, 并按 cf.env 的 CLASH_YML 写回 clash 配置
+./cfip
 
 # 限定网段穷举
 ./cfip -cidr 172.64.229.0/24
@@ -57,35 +71,56 @@
 | `-rounds` | 3 | 精测轮数 |
 | `-refine` | 200 | 进入精测的候选数 |
 | `-c` / `-rc` | 200 / 8 | 阶段 1 / 阶段 2 并发数 |
-| `-apply` | false | 把最优 IP 写回 cf.env 的 `IP=` 行 |
-| `-verify` | false | 校验 TLS 证书（默认跳过，系统 CA 过旧会误判） |
+| `-verify` | false | 校验 TLS 证书（仅 TLS+WS 模式；默认跳过，系统 CA 过旧会误判） |
+
+写回目标由 `cf.env` 的 `CLASH_YML` 决定，没有对应的命令行参数。
 
 ## cf.env
 
 ```ini
 # ---- 连接信息 ----
-SNI=example.com             # 必填，对应 tlsSettings.serverName
-HOST=example.com            # 不填则同 SNI
+HOST=example.com            # 配了 PASSWORD 才必填；同时作为 TLS SNI 和 HTTP Host
 PORT=2096
 WS_PATH=/                   # 键名是 WS_PATH，避免和 shell 的 PATH 撞车
 PROTOCOL=trojan             # trojan / vless / vmess
-PASSWORD=...                # 留空则不测速
+PASSWORD=...                # 留空 = 纯 TCP 模式；填了 = TLS+WS 模式
 XRAY_BIN=/path/to/xray      # 测速用的 xray 可执行文件
+
+# ---- 写回 clash 配置 (可选) ----
+CLASH_YML=                  # 填了就改该文件 proxies 段前 16 个节点的 server
 
 # ---- 测速 (可选) ----
 SPEED_URL=https://proof.ovh.net/files/10Mb.dat   # 留空 = 完全不测速
 SPEED_TOP=5        # 参与测速的候选数
 SPEED_REPEATS=3    # 每个 IP 重复几次取中位数
 SPEED_TIMEOUT=40   # 单次下载超时（秒）
-
-# ---- 上次筛选结果 ----
-IP=                # -apply 会自动改写
 ```
+
+## 写回 clash 配置
+
+`CLASH_YML` 填了路径就启用，程序结束后按最终排名改写该文件 `proxies:` 段里
+**前 16 个**节点的 `server` IP：
+
+```yaml
+proxies:
+  - {name: CF官方优选1, server: 104.17.148.141, port: 2096, type: trojan, ...}
+  #                                              ↑ 只改这里
+```
+
+- 最终顺序：测速成功的按吞吐从高到低排前面，其余按握手排名补齐
+- **`server` 和 `port` 一起改**，都写成 `cf.env` 里的值。只换 IP 会很危险：探测是按
+  `cf.env` 的 `PORT` 做的，保留 yaml 里的旧端口等于把没验证过的 IP 塞进配置
+- `name`/`password`/`sni`/`ws-opts`/引号/注释全部原样保留
+- 只动 `proxies:` 段；`dns` 里同样叫 `server` 的字段不会被误改
+- 条目少于 16 个时全改并打印警告，不会静默跳过
+- 写文件是「写临时文件 + rename」，中途失败不会留下半个配置文件
+
+改完不会自动重启 clash，需要的话自己 reload。
 
 **不测速的三种情况**（都会在启动时明确提示原因）：
 
 - `SPEED_URL` 为空
-- 没配 `PASSWORD`
+- 没配 `PASSWORD`（纯 TCP 模式）
 - `XRAY_BIN` 没配或文件不存在
 
 只有 `SPEED_*` 这组可以被同名环境变量覆盖（文件优先级更高的是环境变量），连接参数必须写在文件里 —— 否则会和 shell 的同名变量撞车。

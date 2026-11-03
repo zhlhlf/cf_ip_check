@@ -1,15 +1,23 @@
 // cfip 批量筛选 Cloudflare 优选 IP。
 //
-// 与上游 cf_ip_check 的区别: 上游只测 TCP connect, 而 TCP 三次握手在 Cloudflare
-// anycast 网络里几乎恒定为 70ms 左右, 完全不反映真实可用性和体验。本工具改为执行
-// 完整的 WebSocket 握手 (TCP -> TLS 1.3 -> HTTP Upgrade 101), 只有真正返回 101 的
-// IP 才算可用, 并按握手总耗时排序。
+// 两种探测模式, 由 cf.env 里是否配置 PASSWORD 决定:
+//
+//   - 纯 TCP 模式 (PASSWORD 为空, 默认): 只做 TCP 三次握手。零配置即可运行,
+//     但 TCP 握手在 Cloudflare anycast 网络里几乎恒定为 70ms 左右, 只能筛掉
+//     完全不可达的 IP, 不反映真实可用性和速度。
+//   - TLS+WS 模式 (配置了 PASSWORD): 执行完整握手 TCP -> TLS 1.3 -> HTTP
+//     Upgrade 101, 只有真正返回 101 的 IP 才算可用, 并可继续用 xray 隧道做
+//     真实吞吐测速。
+//
+// cf.env.example 已内嵌进二进制: 首次运行找不到 cf.env 时会自动生成一份。
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,10 +39,18 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// envTemplate 是编译进二进制的配置模板, 首次运行时写到 cf.env。
+//
+//go:embed cf.env.example
+var envTemplate []byte
+
 const (
 	maxCIDRs   = 4096
 	maxIPs     = 20000
 	maxLineLen = 16384
+
+	// clashIPCount 是写回 clash 配置时改写的代理条目数。
+	clashIPCount = 16
 
 	defaultPort    = 2096
 	defaultPath    = "/"
@@ -69,12 +86,14 @@ type cidrBlock struct {
 
 // probeTarget 描述一次探测需要的全部参数。
 type probeTarget struct {
-	port     int
-	sni      string // TLS SNI, 对应 tlsSettings.serverName
-	host     string // HTTP Host 头, 对应 wsSettings.host
+	port int
+	// host 同时用作 TLS SNI (tlsSettings.serverName) 和 HTTP Host 头
+	// (wsSettings.host): 两者在 CF 的 WS 节点上必然是同一个域名。
+	host     string
 	path     string
 	insecure bool
 	timeout  time.Duration
+	full     bool // true: TCP -> TLS -> WS 101; false: 只做 TCP 握手
 }
 
 // sample 是一轮探测的结果, 全部为相对开始的累计耗时。
@@ -101,19 +120,22 @@ func main() {
 		workers   = flag.Int("c", defaultWorkers, "阶段1快筛并发数")
 		refineC   = flag.Int("rc", 8, "阶段2精测并发数 (高并发会排队, 污染延迟测量)")
 		timeoutMs = flag.Int("timeout", 5000, "单次探测超时(毫秒)")
-		verify    = flag.Bool("verify", false, "校验 TLS 证书 (默认跳过, 避免系统 CA 过旧导致误判)")
+		verify    = flag.Bool("verify", false, "校验 TLS 证书 (仅 TLS+WS 模式; 默认跳过, 避免系统 CA 过旧导致误判)")
 		refineN   = flag.Int("refine", 200, "进入精测的候选数量")
 		cidrFlag  = flag.String("cidr", "", "限定网段, 逗号分隔 (如 172.64.229.0/24), 覆盖在线列表")
 		noFetch   = flag.Bool("no-fetch", false, "不拉取在线 CIDR 列表, 只用内置网段")
-		envFile   = flag.String("env", "cf.env", "配置文件, 内含 SNI/端口/密码/测速参数")
-		apply     = flag.Bool("apply", false, "把最优 IP 写回 cf.env")
+		envFile   = flag.String("env", "cf.env", "配置文件, 内含 Host/端口/密码/测速参数")
 		showVer   = flag.Bool("version", false, "打印版本号后退出")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: %s [选项]\n\n", os.Args[0])
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
-所有连接参数 (SNI/Host/端口/路径/密码/xray 路径) 都在 cf.env 里配置。
+所有连接参数 (Host/端口/路径/密码/xray 路径) 都在 cf.env 里配置。
+cf.env 不存在时会自动生成 (内置 cf.env.example)。
+
+PASSWORD 为空 (默认) 时只做纯 TCP 探测; 配置 PASSWORD 后自动启用
+TLS+WS 握手探测和 xray 隧道测速。
 
 示例:
   %s
@@ -129,7 +151,9 @@ func main() {
 	}
 
 	// ---- 读 cf.env: 连接参数 + 测速参数 ----
-	conf, err := loadConfig(*envFile)
+	// 只有默认的 cf.env 会被自动创建; 显式指定的 -env 路径不存在仍报错,
+	// 避免路径写错时悄悄生成一个模板。
+	conf, err := loadConfig(*envFile, filepath.Clean(*envFile) == "cf.env")
 	if err != nil {
 		die("%v", err)
 	}
@@ -138,19 +162,30 @@ func main() {
 	target := probeTarget{
 		port:     conf.Port,
 		path:     conf.Path,
-		sni:      conf.SNI,
 		host:     conf.Host,
 		insecure: !*verify,
 		timeout:  time.Duration(*timeoutMs) * time.Millisecond,
+		full:     conf.FullProbe(),
 	}
 
-	fmt.Printf("\n目标   SNI=%s  Host=%s  port=%d  path=%s  protocol=%s\n",
-		target.sni, target.host, target.port, target.path, conf.Protocol)
-	fmt.Printf("探测   TCP + TLS1.3 + WS升级101   单次超时=%v  并发=%d\n", target.timeout, *workers)
+	if target.full {
+		fmt.Printf("\n目标   Host=%s  port=%d  path=%s  protocol=%s\n",
+			target.host, target.port, target.path, conf.Protocol)
+		fmt.Printf("探测   TCP + TLS1.3 + WS升级101   单次超时=%v  并发=%d\n", target.timeout, *workers)
+	} else {
+		fmt.Printf("\n目标   纯 TCP  port=%d   单次超时=%v  并发=%d\n",
+			target.port, target.timeout, *workers)
+		fmt.Println("探测   仅 TCP 握手 (未配置 PASSWORD; 配置后启用 TLS+WS 探测与测速)")
+	}
 	if !conf.CanSpeed() {
 		fmt.Printf("测速   ✗ 跳过%s\n", conf.SpeedSkipReason())
 	} else {
 		fmt.Printf("测速   ✓ 源=%s 前%d名 x%d次\n", sp.URL, sp.Top, sp.Repeats)
+	}
+	if conf.ClashYML != "" {
+		fmt.Printf("写回   ✓ %s (前 %d 个节点的 IP+port)\n", conf.ClashYML, clashIPCount)
+	} else {
+		fmt.Println("写回   ✗ 未配置 CLASH_YML, 只打印结果")
 	}
 
 	// ---- 生成候选 ----
@@ -178,7 +213,10 @@ func main() {
 	}
 	fmt.Printf("       可用 %d / %d, 耗时 %v\n\n", len(alive), len(candidates), time.Since(t0).Round(time.Millisecond))
 	if len(alive) == 0 {
-		die("没有任何 IP 通过 WS 握手, 检查 SNI/Host/端口是否正确")
+		if target.full {
+			die("没有任何 IP 通过 WS 握手, 检查 Host/端口是否正确")
+		}
+		die("没有任何 IP 能建立 TCP 连接, 检查端口是否正确")
 	}
 
 	// ---- 阶段 2: 多轮精测 ----
@@ -208,10 +246,18 @@ func main() {
 	if n > len(final) {
 		n = len(final)
 	}
-	fmt.Printf("%-3s %-16s %8s %8s %8s %8s %7s\n", "#", "IP", "TCP", "TLS", "WS升级", "总计", "成功率")
+	if target.full {
+		fmt.Printf("%-3s %-16s %8s %8s %8s %8s %7s\n", "#", "IP", "TCP", "TLS", "WS升级", "总计", "成功率")
+	} else {
+		fmt.Printf("%-3s %-16s %8s %7s\n", "#", "IP", "TCP", "成功率")
+	}
 	fmt.Println(strings.Repeat("-", 68))
 	for i := 0; i < n; i++ {
 		r := final[i]
+		if !target.full {
+			fmt.Printf("%-3d %-16s %6.0fms %5d/%d\n", i+1, r.ip, ms(r.total), r.ok, r.tries)
+			continue
+		}
 		med := func(get func(sample) time.Duration) time.Duration {
 			ds := make([]time.Duration, len(r.samples))
 			for k, s := range r.samples {
@@ -231,25 +277,37 @@ func main() {
 	// 握手延迟只反映"连上 CF 边缘"的耗时, 不反映隧道内的实际转发能力:
 	// 同一个 /24 里出现过握手 230ms 的 IP 下载速度只有另一个的 1/4。
 	// 所以真正决定用哪个 IP 的必须是端到端吞吐。
-	applyIP := final[0].ip
+	// ordered 是最终交付顺序: 测速成功的按吞吐排在前, 其余按握手排名补齐。
+	ordered := make([]string, 0, len(final))
+	for _, r := range final {
+		ordered = append(ordered, r.ip)
+	}
 	if conf.CanSpeed() {
-		applyIP = runSpeedStage(sp, final, conf, target)
+		ordered = runSpeedStage(sp, final, conf, target)
+	} else if !target.full {
+		fmt.Println("\n提示   纯 TCP 模式: 只测 connect 耗时, 只能筛掉不可达的 IP")
+		fmt.Println("       在 cf.env 里配置 PASSWORD 后自动启用 TLS+WS 探测和真实吞吐测速")
 	} else {
 		fmt.Println("\n提示   跳过测速" + conf.SpeedSkipReason())
 		fmt.Println("       当前排名只按握手延迟, 不代表真实速度 (握手 230ms 的 IP 下载可能只有别人 1/4)")
 	}
 
-	// 写回: 直接改 cf.env 里的 IP 字段, 不碰 xray config.json
-	if *apply {
-		if err := conf.writeIP(*envFile, applyIP); err != nil {
-			die("写回 %s 失败: %v", *envFile, err)
+	// 写回: 只改 clash 配置里节点的 server 字段, 不动 cf.env 本身。
+	if conf.ClashYML != "" {
+		n, err := writeClashIPs(conf.ClashYML, ordered, clashIPCount, conf.Port)
+		if err != nil {
+			die("写回 %s 失败: %v", conf.ClashYML, err)
 		}
-		fmt.Printf("\n已写回 %s -> IP=%s\n", *envFile, applyIP)
+		fmt.Printf("\n已写回 %s: 前 %d 个节点, port=%d, %s ... %s\n",
+			conf.ClashYML, n, conf.Port, ordered[0], ordered[n-1])
 	}
 }
 
-// runSpeedStage 对握手排名靠前的候选做真实吞吐测试, 返回综合最优 IP。
-func runSpeedStage(sp speedProfile, final []rank, conf *cfConfig, target probeTarget) string {
+// runSpeedStage 对握手排名靠前的候选做真实吞吐测试, 返回最终交付顺序。
+//
+// 顺序是: 测速成功的按吞吐从高到低排前面, 其余候选 (测速失败或没进测速名单)
+// 按握手排名补齐。写回 clash 时直接取这个顺序的前 N 个。
+func runSpeedStage(sp speedProfile, final []rank, conf *cfConfig, target probeTarget) []string {
 	m := sp.Top
 	if m > len(final) {
 		m = len(final)
@@ -272,13 +330,27 @@ func runSpeedStage(sp speedProfile, final []rank, conf *cfConfig, target probeTa
 			i+1, r.ip, ms(r.handshake), firstByte, r.mbps, score(r))
 	}
 
-	if len(results) == 0 || results[0].mbps <= 0 {
-		fmt.Println("\n警告   所有测速均失败, 回退到握手排名")
-		return final[0].ip
+	ordered := make([]string, 0, len(final))
+	seen := make(map[string]bool, len(final))
+	for _, r := range results {
+		if r.mbps > 0 && !seen[r.ip] {
+			ordered = append(ordered, r.ip)
+			seen[r.ip] = true
+		}
 	}
-	fmt.Printf("\n综合最优: %s  握手 %.0fms  下载 %.2f MB/s\n",
-		results[0].ip, ms(results[0].handshake), results[0].mbps)
-	return results[0].ip
+	if len(ordered) == 0 {
+		fmt.Println("\n警告   所有测速均失败, 回退到握手排名")
+	} else {
+		fmt.Printf("\n综合最优: %s  握手 %.0fms  下载 %.2f MB/s\n",
+			ordered[0], ms(results[0].handshake), results[0].mbps)
+	}
+	for _, r := range final {
+		if !seen[r.ip] {
+			ordered = append(ordered, r.ip)
+			seen[r.ip] = true
+		}
+	}
+	return ordered
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -306,7 +378,7 @@ func (s speedProfile) Enabled() bool { return s.URL != "" }
 
 // envOverrides 允许用真环境变量临时覆盖测速参数, 方便一次性试跑。
 //
-// 只放行 SPEED_* 这一组: 连接参数 (SNI/PORT/WS_PATH 等) 必须来自文件,
+// 只放行 SPEED_* 这一组: 连接参数 (HOST/PORT/WS_PATH 等) 必须来自文件,
 // 否则会和 shell 自己的同名变量撞车 —— PATH 就曾把 WS 路径覆盖成了 $PATH。
 func envOverrides() map[string]string {
 	out := map[string]string{}
@@ -318,6 +390,21 @@ func envOverrides() map[string]string {
 	return out
 }
 
+// initConfig 在 cf.env 缺失时用内嵌模板创建它, 并返回解析结果。
+func initConfig(path string) (map[string]string, error) {
+	if err := os.WriteFile(path, envTemplate, 0o600); err != nil {
+		// 只读目录等场景: 不停机, 直接拿模板内容当默认配置。
+		fmt.Fprintf(os.Stderr, "警告: 无法创建 %s (%v), 使用内置默认配置\n", path, err)
+		return parseEnvReader(bytes.NewReader(envTemplate))
+	}
+	fmt.Printf("配置   未找到 %s, 已按内置模板生成, 按需修改后重跑\n", path)
+	vals, err := parseEnvFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("生成 %s 后读取失败: %w", path, err)
+	}
+	return vals, nil
+}
+
 // parseEnvFile 解析简单的 KEY=VALUE 文件, 支持 # 注释和可选引号。
 func parseEnvFile(path string) (map[string]string, error) {
 	f, err := os.Open(path)
@@ -325,9 +412,12 @@ func parseEnvFile(path string) (map[string]string, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return parseEnvReader(f)
+}
 
+func parseEnvReader(r io.Reader) (map[string]string, error) {
 	vals := map[string]string{}
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -428,8 +518,13 @@ func probeOnce(ip string, t probeTarget) (sample, error) {
 	}
 	s.tcp = time.Since(start)
 
+	// 纯 TCP 模式: 只关心能否建立连接, 拿到 connect 耗时就可以收工。
+	if !t.full {
+		return s, nil
+	}
+
 	tlsConn := tls.Client(raw, &tls.Config{
-		ServerName:         t.sni,
+		ServerName:         t.host,     // 与下面的 Host 头一致
 		InsecureSkipVerify: t.insecure, //nolint:gosec // 探测工具, 默认跳过证书校验
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{"http/1.1"},
@@ -617,7 +712,7 @@ func (c *cfConfig) outbound(ip string) map[string]interface{} {
 			"network":  "ws",
 			"security": "tls",
 			"tlsSettings": map[string]interface{}{
-				"serverName":    c.SNI,
+				"serverName":    c.Host,
 				"allowInsecure": false,
 				"fingerprint":   "chrome",
 			},
@@ -845,15 +940,22 @@ func ipToString(ip uint32) string {
 
 // cfConfig 是 cf.env 解析后的结果: 连接参数 + xray 路径 + 测速参数。
 type cfConfig struct {
-	SNI      string
+	// Host 同时是 TLS SNI 和 HTTP Host 头; 只有这一个域名参数。
 	Host     string
 	Port     int
 	Path     string
 	Protocol string
 	Password string
 	XrayBin  string
+	ClashYML string // 非空则把筛出的 IP 写回该 clash 配置
 	Speed    speedProfile
 }
+
+// FullProbe 判断是否走完整握手探测 (TCP -> TLS -> WS 101)。
+//
+// 以 PASSWORD 为开关: 没有密码时隧道和测速都用不了, 做 TLS/WS 握手也证明不了
+// 节点可用, 不如退化成纯 TCP 探测 —— 零配置、没有 HOST 也能跑。
+func (c *cfConfig) FullProbe() bool { return c.Password != "" }
 
 // CanSpeed 判断是否具备测速条件: 要有下载源、密码和真实存在的 xray 可执行文件。
 func (c *cfConfig) CanSpeed() bool {
@@ -867,7 +969,10 @@ func (c *cfConfig) speedBlockers() []string {
 		miss = append(miss, "SPEED_URL 为空")
 	}
 	if c.Password == "" {
-		miss = append(miss, "缺少 PASSWORD")
+		miss = append(miss, "缺少 PASSWORD (纯 TCP 模式)")
+	}
+	if c.Password != "" && c.Host == "" {
+		miss = append(miss, "缺少 HOST")
 	}
 	switch {
 	case c.XrayBin == "":
@@ -887,33 +992,45 @@ func (c *cfConfig) SpeedSkipReason() string {
 	return " (" + strings.Join(miss, ", ") + ")"
 }
 
-// loadConfig 读取 cf.env。SNI 是必填项, 其余有默认值。
-func loadConfig(path string) (*cfConfig, error) {
+// loadConfig 读取 cf.env, 其余字段都有默认值。
+//
+// create 为 true 且文件不存在时, 用内嵌的 cf.env.example 生成一份再读;
+// 写不出来 (比如当前目录只读) 则直接拿模板内容继续跑, 不阻塞纯 TCP 模式。
+func loadConfig(path string, create bool) (*cfConfig, error) {
 	vals, err := parseEnvFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("配置文件不存在: %s (复制 cf.env.example 或自己创建一个)", path)
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("读取 %s 失败: %w", path, err)
 		}
-		return nil, fmt.Errorf("读取 %s 失败: %w", path, err)
+		if !create {
+			return nil, fmt.Errorf("配置文件不存在: %s (用默认 cf.env 运行会自动生成模板)", path)
+		}
+		vals, err = initConfig(path)
+		if err != nil {
+			return nil, err
+		}
 	}
 	for k, v := range envOverrides() {
 		vals[k] = v
 	}
 
+	// 旧版 cf.env 把 SNI 和 HOST 分成两个键。SNI 和 Host 在 WS 节点上必然是同一个
+	// 域名, 现在只保留 HOST; 老配置里的 SNI 仍读一次作为回退, 避免升级后突然报缺 HOST。
 	c := &cfConfig{
-		SNI:      vals["SNI"],
 		Host:     vals["HOST"],
 		Port:     defaultPort,
 		Path:     defaultPath,
 		Protocol: vals["PROTOCOL"],
 		Password: vals["PASSWORD"],
 		XrayBin:  vals["XRAY_BIN"],
-	}
-	if c.SNI == "" {
-		return nil, fmt.Errorf("%s 缺少 SNI", path)
+		ClashYML: vals["CLASH_YML"],
 	}
 	if c.Host == "" {
-		c.Host = c.SNI
+		c.Host = vals["SNI"]
+	}
+	// 纯 TCP 模式用不到 HOST/WS_PATH; 只有走 TLS+WS 握手和测速时才必填。
+	if c.Host == "" && c.FullProbe() {
+		return nil, fmt.Errorf("%s 缺少 HOST (配了 PASSWORD 就必须填 HOST)", path)
 	}
 	if c.Protocol == "" {
 		c.Protocol = "trojan"
@@ -976,28 +1093,133 @@ func parseSpeedProfile(vals map[string]string, path string) (speedProfile, error
 	return sp, nil
 }
 
-// writeIP 把选出的 IP 写回 cf.env 的 IP 行 (没有就追加)。
-func (c *cfConfig) writeIP(path, ip string) error {
+// clashServerRe 匹配 clash 代理条目里的 IPv4 server 字段, 兼容无引号和带引号两种写法。
+//
+// 第 1 组是到 IP 为止的前缀 (含可能的引号), 第 2 组是 IP 本身; 只替换第 2 组,
+// 前后引号和其余内容都留在原位。RE2 不支持反向引用, 所以不校验收尾引号。
+var clashServerRe = regexp.MustCompile(
+	`(?m)(\bserver:\s*["']?)(\d{1,3}(?:\.\d{1,3}){3})`)
+
+// clashPortRe 匹配 port 字段, 写法同 clashServerRe (第 2 组是端口号)。
+var clashPortRe = regexp.MustCompile(`(?m)(\bport:\s*["']?)(\d{1,5})`)
+
+// clashItemRe 匹配 proxies 段里的列表项起始 (块列表的 "- name: ..." 或 "- {...}")。
+//
+// 按条目切分而不是按 server 匹配位置切分: 同一段的 port 可能在 server 前面
+// (行内写法) 或后面 (块写法), 只有知道条目边界才能准确找到属于它的 port。
+var clashItemRe = regexp.MustCompile(`(?m)^[ \t]*-[ \t]`)
+
+// clashProxiesKeyRe 定位顶层 proxies: 键; clashTopKeyRe 匹配下一个顶格键。
+//
+// 用两步查找而不是一个带先行断言的正则: Go 的 RE2 不支持 (?=...)。不给段设边界
+// 就会改到 dns/nameserver 里同样叫 server 的字段 —— 那些不是节点。
+var (
+	clashProxiesKeyRe = regexp.MustCompile(`(?m)^proxies:`)
+	clashTopKeyRe     = regexp.MustCompile(`(?m)^[A-Za-z_-]+:`)
+)
+
+// clashProxiesSpan 返回 proxies 段在 data 中的 [start,end) 区间。
+func clashProxiesSpan(data []byte) (int, int, bool) {
+	h := clashProxiesKeyRe.FindIndex(data)
+	if h == nil {
+		return 0, 0, false
+	}
+	start := h[1]
+	end := len(data)
+	if m := clashTopKeyRe.FindIndex(data[start:]); m != nil {
+		end = start + m[0]
+	}
+	return start, end, true
+}
+
+// clashEdit 是一次替换: 把 sec[start:end] 换成 text。
+type clashEdit struct {
+	start, end int
+	text       string
+}
+
+// writeClashIPs 按顺序改写 clash 配置 proxies 段里前 n 个节点的 server IP 和 port,
+// 返回实际改写数量。
+//
+// server 和 port 必须一起改: 探测是按 cf.env 的 PORT 做的, 只换 IP 而保留 yaml 里
+// 的旧端口, 写进去的节点在旧端口上根本没验证过, 会变成一堆死节点。
+//
+// 其余内容 (name/password/sni/ws-opts/注释) 原样保留, 也不碰 proxies 段以外的同名键。
+// 条目数多于 n 时只改前 n 个, 少于 n 个则全改并给出提示 —— 不静默截断。
+func writeClashIPs(path string, ips []string, n, port int) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	lines := strings.Split(string(data), "\n")
-	replaced := false
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "IP=") || strings.HasPrefix(trimmed, "IP =") {
-			lines[i] = "IP=" + ip
-			replaced = true
+	ss, se, ok := clashProxiesSpan(data)
+	if !ok {
+		return 0, fmt.Errorf("没找到顶层 proxies: 段, 确认这是 clash 配置而不是别的 yaml")
+	}
+
+	sec := data[ss:se]
+	items := clashItemRe.FindAllIndex(sec, -1)
+	if len(items) == 0 {
+		if len(clashServerRe.FindAllIndex(sec, -1)) > 0 {
+			return 0, fmt.Errorf("proxies 段不是块列表格式 (每项以 \"- \" 开头), 不支持改写")
+		}
+		return 0, fmt.Errorf("proxies 段里没找到任何节点条目")
+	}
+
+	portStr := strconv.Itoa(port)
+	var edits []clashEdit
+	done, noPort := 0, 0
+	for i, it := range items {
+		if done >= n || done >= len(ips) {
 			break
 		}
+		start, end := it[0], len(sec)
+		if i+1 < len(items) {
+			end = items[i+1][0]
+		}
+		item := sec[start:end]
+
+		sv := clashServerRe.FindSubmatchIndex(item)
+		if sv == nil {
+			continue // 非节点条目 (比如只有 name 的分组项)
+		}
+		edits = append(edits, clashEdit{start + sv[4], start + sv[5], ips[done]})
+		if pv := clashPortRe.FindSubmatchIndex(item); pv != nil {
+			edits = append(edits, clashEdit{start + pv[4], start + pv[5], portStr})
+		} else {
+			noPort++
+		}
+		done++
 	}
-	if !replaced {
-		lines = append(lines, "IP="+ip)
+	if len(edits) == 0 {
+		return 0, fmt.Errorf("proxies 段里没找到任何 server: <IPv4> 条目")
 	}
+	if done < n {
+		fmt.Printf("警告   %s 的 proxies 段只有 %d 个节点, 少于预期的 %d 个, 只改写这些\n",
+			path, done, n)
+	}
+	if noPort > 0 {
+		fmt.Printf("警告   %d 个节点没有 port 字段, 只改了 IP (新 IP 未必在旧配置的端口上验证过)\n", noPort)
+	}
+
+	// edits 按条目顺序追加, 天然有序; 同一条目内 server 在 port 之前。
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	var sec2 bytes.Buffer
+	last := 0
+	for _, e := range edits {
+		sec2.Write(sec[last:e.start])
+		sec2.WriteString(e.text)
+		last = e.end
+	}
+	sec2.Write(sec[last:])
+
+	var out bytes.Buffer
+	out.Write(data[:ss])
+	out.Write(sec2.Bytes())
+	out.Write(data[se:])
+
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
-		return err
+	if err := os.WriteFile(tmp, out.Bytes(), 0o644); err != nil {
+		return 0, err
 	}
-	return os.Rename(tmp, path)
+	return done, os.Rename(tmp, path)
 }

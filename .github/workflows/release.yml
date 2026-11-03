@@ -62,6 +62,7 @@ jobs:
           # 容器已用 --user 身份运行, 正常情况下 dist 就属于当前用户;
           # 兜底处理旧产物遗留的 root 权限
           chown -R "$(id -u):$(id -g)" dist 2>/dev/null || true
+          # cf.env.example 已由 go:embed 编进二进制, 这里额外附一份方便直接查看
           cp cf.env.example dist/cf.env.example
           cp README.md dist/README.md
           cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* cf.env.example README.md && ls -lh
@@ -79,16 +80,19 @@ jobs:
             ## 使用方法
 
             1. 下载对应平台的 `cfip-<os>-<arch>`
-            2. 复制配置模板并填写自己的节点信息:
-               ```bash
-               cp cf.env.example cf.env
-               # 编辑 cf.env, 至少填 SNI、PORT、PASSWORD、XRAY_BIN
-               ```
-            3. 运行:
+            2. 直接运行, 首次运行会自动生成 `cf.env`:
                ```bash
                chmod +x cfip-linux-amd64
-               ./cfip-linux-amd64 -apply
+               ./cfip-linux-amd64
                ```
+               默认是纯 TCP 模式, 无需任何配置。
+            3. 编辑生成的 `cf.env`, 填写 `PASSWORD`、`HOST`、`PORT`、`XRAY_BIN`
+               后重跑, 即切换到 TLS+WS 探测 + 隧道测速:
+               ```bash
+               ./cfip-linux-amd64
+               ```
+            4. 想把结果写回 clash 配置, 在 `cf.env` 里设置 `CLASH_YML=/path/to/config.yml`,
+               程序会改写该文件 `proxies` 段前 16 个节点的 IP。
 
             `cf.env` 含节点密码, 已在 `.gitignore` 中忽略, 请勿提交。
 
