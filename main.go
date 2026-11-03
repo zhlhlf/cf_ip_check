@@ -60,8 +60,24 @@ const (
 	defaultWorkers = 200
 	defaultTimeout = 5 * time.Second
 
-	cidrURL = "https://ghfast.top/raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt"
+	// cidrFetchTimeout 是单个源的等待时间; 源之间串联, 最坏情况是条数 x 该值。
+	cidrFetchTimeout = 5 * time.Second
 )
+
+// cidrSources 是在线 CIDR 列表的下载地址, 按顺序逐个尝试, 第一个可用的胜出。
+//
+// 第一条是 GitHub 直连; 后面是几个常用的加速镜像 (写法是把完整 URL 拼在域名后,
+// jsdelivr 除外, 它有自己的 gh/<user>/<repo>@<ref> 路径)。镜像随时可能失效,
+// 所以不做"首选某个镜像"的假设, 只保证一个挂了能自动试下一个。
+const cidrRepoPath = "cmliu/cmliu/main/CF-CIDR.txt"
+
+var cidrSources = []string{
+	"https://raw.githubusercontent.com/" + cidrRepoPath,
+	"https://ghfast.top/https://raw.githubusercontent.com/" + cidrRepoPath,
+	"https://gh-proxy.com/https://raw.githubusercontent.com/" + cidrRepoPath,
+	"https://ghproxy.net/https://raw.githubusercontent.com/" + cidrRepoPath,
+	"https://cdn.jsdelivr.net/gh/cmliu/cmliu@main/CF-CIDR.txt",
+}
 
 // version 由构建时注入: -ldflags "-X main.version=xxx"
 var version = "dev"
@@ -787,18 +803,37 @@ func medianDuration(ds []time.Duration) time.Duration {
 
 func loadCIDRs(fetch bool) []cidrBlock {
 	if fetch {
-		if body, err := fetchURL(cidrURL); err == nil {
-			if cs := parseCIDRLines(strings.NewReader(body)); len(cs) > 0 {
-				return cs
+		if cs, src := fetchCIDRs(); len(cs) > 0 {
+			// 默认走直连, 只有回退到镜像时才提示一句, 正常情况不打扰。
+			if src != cidrSources[0] {
+				fmt.Printf("CIDR   直连 GitHub 失败, 在线列表来自镜像 %s\n", src)
 			}
+			return cs
 		}
 		fmt.Println("获取在线 CIDR 失败, 使用内置网段")
 	}
 	return parseCIDRLines(strings.NewReader(strings.Join(fallbackCIDRs, "\n")))
 }
 
-func fetchURL(url string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+// fetchCIDRs 按 cidrSources 顺序尝试, 返回第一个能解析出合法网段的列表及其来源。
+//
+// 逐个串行是为了不放大请求; 单个源超时 5 秒, 解析不出网段也算失败 (镜像返回
+// 错误页时通常是 200 + HTML, 只看 HTTP 状态会误判成功)。
+func fetchCIDRs() ([]cidrBlock, string) {
+	for _, src := range cidrSources {
+		body, err := fetchURL(src, cidrFetchTimeout)
+		if err != nil {
+			continue
+		}
+		if cs := parseCIDRLines(strings.NewReader(body)); len(cs) > 0 {
+			return cs, src
+		}
+	}
+	return nil, ""
+}
+
+func fetchURL(url string, timeout time.Duration) (string, error) {
+	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
