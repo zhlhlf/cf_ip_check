@@ -284,12 +284,6 @@ TLS+WS 握手探测和 xray 隧道测速。
 	}
 	if conf.CanSpeed() {
 		ordered = runSpeedStage(sp, final, conf, target)
-	} else if !target.full {
-		fmt.Println("\n提示   纯 TCP 模式: 只测 connect 耗时, 只能筛掉不可达的 IP")
-		fmt.Println("       在 cf.env 里配置 PASSWORD 后自动启用 TLS+WS 探测和真实吞吐测速")
-	} else {
-		fmt.Println("\n提示   跳过测速" + conf.SpeedSkipReason())
-		fmt.Println("       当前排名只按握手延迟, 不代表真实速度 (握手 230ms 的 IP 下载可能只有别人 1/4)")
 	}
 
 	// 写回: 只改 clash 配置里节点的 server 字段, 不动 cf.env 本身。
@@ -340,9 +334,6 @@ func runSpeedStage(sp speedProfile, final []rank, conf *cfConfig, target probeTa
 	}
 	if len(ordered) == 0 {
 		fmt.Println("\n警告   所有测速均失败, 回退到握手排名")
-	} else {
-		fmt.Printf("\n综合最优: %s  握手 %.0fms  下载 %.2f MB/s\n",
-			ordered[0], ms(results[0].handshake), results[0].mbps)
 	}
 	for _, r := range final {
 		if !seen[r.ip] {
@@ -371,7 +362,6 @@ type speedProfile struct {
 	Top     int           // 参与测速的候选数
 	Repeats int           // 每个 IP 重复下载次数
 	Timeout time.Duration // 单次下载超时
-	Source  string        // 配置来源, 用于提示信息
 }
 
 func (s speedProfile) Enabled() bool { return s.URL != "" }
@@ -1062,7 +1052,7 @@ func loadConfig(path string, create bool) (*cfConfig, error) {
 
 // parseSpeedProfile 从已解析的键值里提取测速参数。SPEED_URL 为空即不测速。
 func parseSpeedProfile(vals map[string]string, path string) (speedProfile, error) {
-	sp := speedProfile{Top: 5, Repeats: 3, Timeout: 40 * time.Second, Source: path}
+	sp := speedProfile{Top: 5, Repeats: 3, Timeout: 40 * time.Second}
 	sp.URL = vals["SPEED_URL"]
 
 	for _, kv := range []struct {
