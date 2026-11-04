@@ -58,7 +58,11 @@ const (
 	defaultRounds  = 3
 	defaultTop     = 20
 	defaultWorkers = 200
-	defaultTimeout = 5 * time.Second
+
+	// 默认超时按探测深度区分: 纯 TCP 只等握手, TLS+WS 要多等 TLS 握手和
+	// 一次 HTTP 升级往返, 用同一个值会让深探测在抖动时被误杀。
+	tcpTimeout = time.Second
+	wsTimeout  = 2200 * time.Millisecond
 
 	// cidrFetchTimeout 是单个源的等待时间; 源之间串联, 最坏情况是条数 x 该值。
 	cidrFetchTimeout = 5 * time.Second
@@ -135,7 +139,7 @@ func main() {
 		top       = flag.Int("top", defaultTop, "输出前 N 名")
 		workers   = flag.Int("c", defaultWorkers, "阶段1快筛并发数")
 		refineC   = flag.Int("rc", 8, "阶段2精测并发数 (高并发会排队, 污染延迟测量)")
-		timeoutMs = flag.Int("timeout", 5000, "单次探测超时(毫秒)")
+		timeoutMs = flag.Int("timeout", 0, "单次探测超时(毫秒), 0 = 按模式取默认 (tcp 1000 / ws 2200)")
 		verify    = flag.Bool("verify", false, "校验 TLS 证书 (仅 TLS+WS 模式; 默认跳过, 避免系统 CA 过旧导致误判)")
 		refineN   = flag.Int("refine", 200, "进入精测的候选数量")
 		cidrFlag  = flag.String("cidr", "", "限定网段, 逗号分隔 (如 172.64.229.0/24), 覆盖在线列表")
@@ -175,13 +179,22 @@ TLS+WS 握手探测和 xray 隧道测速。
 	}
 	sp := conf.Speed
 
+	full := conf.FullProbe()
+	timeout := tcpTimeout
+	if full {
+		timeout = wsTimeout
+	}
+	if *timeoutMs > 0 { // 命令行显式指定时覆盖模式默认值
+		timeout = time.Duration(*timeoutMs) * time.Millisecond
+	}
+
 	target := probeTarget{
 		port:     conf.Port,
 		path:     conf.Path,
 		host:     conf.Host,
 		insecure: !*verify,
-		timeout:  time.Duration(*timeoutMs) * time.Millisecond,
-		full:     conf.FullProbe(),
+		timeout:  timeout,
+		full:     full,
 	}
 
 	if target.full {
