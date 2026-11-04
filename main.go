@@ -59,9 +59,9 @@ const (
 	defaultTop     = 20
 	defaultWorkers = 200
 
-	// 默认超时按探测深度区分: 纯 TCP 只等握手, TLS+WS 要多等 TLS 握手和
-	// 一次 HTTP 升级往返, 用同一个值会让深探测在抖动时被误杀。
+	// 默认超时按探测深度区分: 链路越长越容易在抖动时被误杀。
 	tcpTimeout = time.Second
+	tlsTimeout = 2 * time.Second
 	wsTimeout  = 2200 * time.Millisecond
 
 	// cidrFetchTimeout 是单个源的等待时间; 源之间串联, 最坏情况是条数 x 该值。
@@ -104,6 +104,26 @@ type cidrBlock struct {
 	hostCount uint32
 }
 
+// probeMode 决定探测走到哪一步。WS 是在 TLS 之上再加一次 HTTP 升级。
+type probeMode int
+
+const (
+	probeTCP probeMode = iota // TCP 握手
+	probeTLS                  // TCP -> TLS 握手
+	probeWS                   // TCP -> TLS -> HTTP 升级, 校验 101
+)
+
+func (m probeMode) String() string {
+	switch m {
+	case probeTLS:
+		return "tls"
+	case probeWS:
+		return "ws"
+	default:
+		return "tcp"
+	}
+}
+
 // probeTarget 描述一次探测需要的全部参数。
 type probeTarget struct {
 	port int
@@ -113,13 +133,16 @@ type probeTarget struct {
 	path     string
 	insecure bool
 	timeout  time.Duration
-	full     bool // true: TCP -> TLS -> WS 101; false: 只做 TCP 握手
+	mode     probeMode
 }
 
 // sample 是一轮探测的结果, 全部为相对开始的累计耗时。
 type sample struct {
 	tcp, tls, ws time.Duration
 }
+
+// total 返回这次探测的累计耗时。
+func (s sample) total() time.Duration { return s.tcp + s.tls + s.ws }
 
 type rank struct {
 	ip      string
@@ -179,11 +202,8 @@ TLS+WS 握手探测和 xray 隧道测速。
 	}
 	sp := conf.Speed
 
-	full := conf.FullProbe()
-	timeout := tcpTimeout
-	if full {
-		timeout = wsTimeout
-	}
+	mode := conf.Mode()
+	timeout := conf.ProbeTimeout()
 	if *timeoutMs > 0 { // 命令行显式指定时覆盖模式默认值
 		timeout = time.Duration(*timeoutMs) * time.Millisecond
 	}
@@ -194,17 +214,22 @@ TLS+WS 握手探测和 xray 隧道测速。
 		host:     conf.Host,
 		insecure: !*verify,
 		timeout:  timeout,
-		full:     full,
+		mode:     mode,
 	}
 
-	if target.full {
+	switch target.mode {
+	case probeWS:
 		fmt.Printf("\n目标   Host=%s  port=%d  path=%s  protocol=%s\n",
 			target.host, target.port, target.path, conf.Protocol)
 		fmt.Printf("探测   TCP + TLS1.3 + WS升级101   单次超时=%v  并发=%d\n", target.timeout, *workers)
-	} else {
+	case probeTLS:
+		fmt.Printf("\n目标   Host=%s  port=%d\n", target.host, target.port)
+		fmt.Printf("探测   TCP + TLS1.3   单次超时=%v  并发=%d\n", target.timeout, *workers)
+		fmt.Println("       未配置 PASSWORD, 只验证到 TLS 握手; 配置后加测 WS 升级与隧道测速")
+	default:
 		fmt.Printf("\n目标   纯 TCP  port=%d   单次超时=%v  并发=%d\n",
 			target.port, target.timeout, *workers)
-		fmt.Println("探测   仅 TCP 握手 (未配置 PASSWORD; 配置后启用 TLS+WS 探测与测速)")
+		fmt.Println("探测   仅 TCP 握手 (配置 HOST 加测 TLS, 再加 PASSWORD 加测 WS)")
 	}
 	if !conf.CanSpeed() {
 		fmt.Printf("测速   ✗ 跳过%s\n", conf.SpeedSkipReason())
@@ -242,10 +267,14 @@ TLS+WS 握手探测和 xray 隧道测速。
 	}
 	fmt.Printf("       可用 %d / %d, 耗时 %v\n\n", len(alive), len(candidates), time.Since(t0).Round(time.Millisecond))
 	if len(alive) == 0 {
-		if target.full {
+		switch target.mode {
+		case probeWS:
 			die("没有任何 IP 通过 WS 握手, 检查 Host/端口是否正确")
+		case probeTLS:
+			die("没有任何 IP 完成 TLS 握手, 检查 Host/端口是否正确")
+		default:
+			die("没有任何 IP 能建立 TCP 连接, 检查端口是否正确")
 		}
-		die("没有任何 IP 能建立 TCP 连接, 检查端口是否正确")
 	}
 
 	// ---- 阶段 2: 多轮精测 ----
@@ -275,15 +304,18 @@ TLS+WS 握手探测和 xray 隧道测速。
 	if n > len(final) {
 		n = len(final)
 	}
-	if target.full {
+	switch target.mode {
+	case probeWS:
 		fmt.Printf("%-3s %-16s %8s %8s %8s %8s %7s\n", "#", "IP", "TCP", "TLS", "WS升级", "总计", "成功率")
-	} else {
+	case probeTLS:
+		fmt.Printf("%-3s %-16s %8s %8s %8s %7s\n", "#", "IP", "TCP", "TLS", "总计", "成功率")
+	default:
 		fmt.Printf("%-3s %-16s %8s %7s\n", "#", "IP", "TCP", "成功率")
 	}
 	fmt.Println(strings.Repeat("-", 68))
 	for i := 0; i < n; i++ {
 		r := final[i]
-		if !target.full {
+		if target.mode == probeTCP {
 			fmt.Printf("%-3d %-16s %6.0fms %5d/%d\n", i+1, r.ip, ms(r.total), r.ok, r.tries)
 			continue
 		}
@@ -294,10 +326,15 @@ TLS+WS 握手探测和 xray 隧道测速。
 			}
 			return medianDuration(ds)
 		}
+		tcp := ms(med(func(s sample) time.Duration { return s.tcp }))
+		tls := ms(med(func(s sample) time.Duration { return s.tls }))
+		if target.mode == probeTLS {
+			fmt.Printf("%-3d %-16s %6.0fms %6.0fms %6.0fms %5d/%d\n",
+				i+1, r.ip, tcp, tls, ms(r.total), r.ok, r.tries)
+			continue
+		}
 		fmt.Printf("%-3d %-16s %6.0fms %6.0fms %6.0fms %6.0fms %5d/%d\n",
-			i+1, r.ip,
-			ms(med(func(s sample) time.Duration { return s.tcp })),
-			ms(med(func(s sample) time.Duration { return s.tls })),
+			i+1, r.ip, tcp, tls,
 			ms(med(func(s sample) time.Duration { return s.ws })),
 			ms(r.total), r.ok, r.tries)
 	}
@@ -490,7 +527,7 @@ func runProbe(ips []string, t probeTarget, rounds, workers int) []rank {
 					}
 					r.ok++
 					r.samples = append(r.samples, s)
-					if sum := s.tcp + s.tls + s.ws; sum < r.best {
+					if sum := s.total(); sum < r.best {
 						r.best = sum
 					}
 				}
@@ -508,7 +545,7 @@ func runProbe(ips []string, t probeTarget, rounds, workers int) []rank {
 		if r.ok > 0 {
 			ds := make([]time.Duration, len(r.samples))
 			for k, s := range r.samples {
-				ds[k] = s.tcp + s.tls + s.ws
+				ds[k] = s.total()
 			}
 			r.total = medianDuration(ds)
 		} else {
@@ -518,7 +555,11 @@ func runProbe(ips []string, t probeTarget, rounds, workers int) []rank {
 	return out
 }
 
-// probeOnce 完成一次冷连接握手: TCP -> TLS1.3 -> HTTP Upgrade, 校验 101。
+// probeOnce 完成一次冷连接探测, 深度由 t.mode 决定:
+//
+//	probeTCP:  TCP 握手
+//	probeTLS:  TCP -> TLS1.3, 证书校验默认跳过
+//	probeWS:   再接 HTTP Upgrade, 校验 101
 func probeOnce(ip string, t probeTarget) (sample, error) {
 	var s sample
 	addr := net.JoinHostPort(ip, strconv.Itoa(t.port))
@@ -538,7 +579,7 @@ func probeOnce(ip string, t probeTarget) (sample, error) {
 	s.tcp = time.Since(start)
 
 	// 纯 TCP 模式: 只关心能否建立连接, 拿到 connect 耗时就可以收工。
-	if !t.full {
+	if t.mode == probeTCP {
 		return s, nil
 	}
 
@@ -552,6 +593,11 @@ func probeOnce(ip string, t probeTarget) (sample, error) {
 		return s, fmt.Errorf("tls: %w", err)
 	}
 	s.tls = time.Since(start) - s.tcp
+
+	// TLS 模式: 握手成功就算这个 IP 承载该域名 (证书跳过校验时的信任来源)。
+	if t.mode == probeTLS {
+		return s, nil
+	}
 
 	req := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"+
@@ -989,11 +1035,35 @@ type cfConfig struct {
 	Speed    speedProfile
 }
 
-// FullProbe 判断是否走完整握手探测 (TCP -> TLS -> WS 101)。
+// Mode 按配置决定探测深度:
 //
-// 以 PASSWORD 为开关: 没有密码时隧道和测速都用不了, 做 TLS/WS 握手也证明不了
-// 节点可用, 不如退化成纯 TCP 探测 —— 零配置、没有 HOST 也能跑。
-func (c *cfConfig) FullProbe() bool { return c.Password != "" }
+//	无 HOST              -> 纯 TCP, 零配置可跑
+//	有 HOST, 无 PASSWORD -> TCP + TLS, 验证 IP 确实承载该域名
+//	有 HOST, 有 PASSWORD -> 再加 WS 升级, 确认节点接受 101 并可隧道测速
+func (c *cfConfig) Mode() probeMode {
+	switch {
+	case c.Host == "":
+		return probeTCP
+	case c.Password == "":
+		return probeTLS
+	default:
+		return probeWS
+	}
+}
+
+// ProbeTimeout 返回当前模式默认的单次探测超时。
+//
+// 链路越长越容易在抖动时被误杀, 所以逐级放宽。
+func (c *cfConfig) ProbeTimeout() time.Duration {
+	switch c.Mode() {
+	case probeTLS:
+		return tlsTimeout
+	case probeWS:
+		return wsTimeout
+	default:
+		return tcpTimeout
+	}
+}
 
 // CanSpeed 判断是否具备测速条件: 要有下载源、密码和真实存在的 xray 可执行文件。
 func (c *cfConfig) CanSpeed() bool {
@@ -1066,8 +1136,8 @@ func loadConfig(path string, create bool) (*cfConfig, error) {
 	if c.Host == "" {
 		c.Host = vals["SNI"]
 	}
-	// 纯 TCP 模式用不到 HOST/WS_PATH; 只有走 TLS+WS 握手和测速时才必填。
-	if c.Host == "" && c.FullProbe() {
+	// 纯 TCP 模式用不到 HOST; 配了 PASSWORD 必有 HOST, 否则无从做 TLS/WS 握手。
+	if c.Host == "" && c.Password != "" {
 		return nil, fmt.Errorf("%s 缺少 HOST (配了 PASSWORD 就必须填 HOST)", path)
 	}
 	if c.Protocol == "" {
