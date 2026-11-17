@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,6 +168,7 @@ func main() {
 		refineN   = flag.Int("refine", 200, "进入精测的候选数量")
 		cidrFlag  = flag.String("cidr", "", "限定网段, 逗号分隔 (如 172.64.229.0/24), 覆盖在线列表")
 		noFetch   = flag.Bool("no-fetch", false, "不拉取在线 CIDR 列表, 只用内置网段")
+		verbose   = flag.Bool("v", false, "打印每个 CIDR 源的尝试结果与错误")
 		envFile   = flag.String("env", "cf.env", "配置文件, 内含 Host/端口/密码/测速参数")
 		showVer   = flag.Bool("version", false, "打印版本号后退出")
 	)
@@ -250,7 +252,7 @@ TLS+WS 握手探测和 xray 隧道测速。
 			die("-cidr 参数里没有合法网段: %s", *cidrFlag)
 		}
 	} else {
-		cidrs = loadCIDRs(!*noFetch)
+		cidrs = loadCIDRs(!*noFetch, *verbose)
 	}
 	candidates := generateCandidateIPs(cidrs, *nSample, rand.New(rand.NewSource(time.Now().UnixNano())))
 	fmt.Printf("候选   %d 个 (来自 %d 个 CIDR 网段)\n\n", len(candidates), len(cidrs))
@@ -860,9 +862,9 @@ func medianDuration(ds []time.Duration) time.Duration {
 
 // ---------------------------------------------------------------- CIDR
 
-func loadCIDRs(fetch bool) []cidrBlock {
+func loadCIDRs(fetch, verbose bool) []cidrBlock {
 	if fetch {
-		if cs, src := fetchCIDRs(); len(cs) > 0 {
+		if cs, src := fetchCIDRs(verbose); len(cs) > 0 {
 			// 默认走直连, 只有回退到镜像时才提示一句, 正常情况不打扰。
 			if src != cidrSources[0] {
 				fmt.Printf("CIDR   直连 GitHub 失败, 在线列表来自镜像 %s\n", src)
@@ -870,6 +872,9 @@ func loadCIDRs(fetch bool) []cidrBlock {
 			return cs
 		}
 		fmt.Println("获取在线 CIDR 失败, 使用内置网段")
+		if !verbose {
+			fmt.Println("       加 -v 可查看每个源的失败原因")
+		}
 	}
 	return parseCIDRLines(strings.NewReader(strings.Join(fallbackCIDRs, "\n")))
 }
@@ -878,22 +883,146 @@ func loadCIDRs(fetch bool) []cidrBlock {
 //
 // 逐个串行是为了不放大请求; 单个源超时 5 秒, 解析不出网段也算失败 (镜像返回
 // 错误页时通常是 200 + HTML, 只看 HTTP 状态会误判成功)。
-func fetchCIDRs() ([]cidrBlock, string) {
-	for _, src := range cidrSources {
+func fetchCIDRs(verbose bool) ([]cidrBlock, string) {
+	for i, src := range cidrSources {
+		start := time.Now()
 		body, err := fetchURL(src, cidrFetchTimeout)
+		took := time.Since(start).Round(time.Millisecond)
 		if err != nil {
+			if verbose {
+				fmt.Printf("CIDR   [%d/%d] %v 失败: %v\n", i+1, len(cidrSources), took, err)
+			}
 			continue
 		}
-		if cs := parseCIDRLines(strings.NewReader(body)); len(cs) > 0 {
+		cs := parseCIDRLines(strings.NewReader(body))
+		if len(cs) > 0 {
+			if verbose {
+				fmt.Printf("CIDR   [%d/%d] %v 成功: %d 个网段\n", i+1, len(cidrSources), took, len(cs))
+			}
 			return cs, src
+		}
+		if verbose {
+			fmt.Printf("CIDR   [%d/%d] %v 无有效网段 (返回 %d 字节)\n", i+1, len(cidrSources), took, len(body))
 		}
 	}
 	return nil, ""
 }
 
-func fetchURL(url string, timeout time.Duration) (string, error) {
-	client := &http.Client{Timeout: timeout}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// dohEndpoints 是 DNS-over-HTTPS 的 JSON 接口, 全部用 IP 直连, 所以查它们本身
+// 不需要 DNS。纯静态的 android 构建没有 /etc/resolv.conf, Go 只会去问
+// 127.0.0.1:53 并立刻被拒 (Go issue #10714), 这时只能靠 DoH 兜底。
+var dohEndpoints = []string{
+	"https://223.5.5.5/resolve?type=A&name=",
+	"https://1.1.1.1/dns-query?type=A&name=",
+}
+
+type dohResponse struct {
+	Status int `json:"Status"`
+	Answer []struct {
+		Type int    `json:"type"`
+		Data string `json:"data"`
+	} `json:"Answer"`
+}
+
+func dohLookup(ctx context.Context, host string) ([]string, error) {
+	var lastErr error
+	for _, ep := range dohEndpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep+url.QueryEscape(host), nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Accept", "application/dns-json")
+		client := &http.Client{Timeout: cidrFetchTimeout}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var dr dohResponse
+		if err := json.Unmarshal(body, &dr); err != nil {
+			lastErr = fmt.Errorf("%s: 响应不是 JSON: %v", ep, err)
+			continue
+		}
+		var ips []string
+		for _, a := range dr.Answer {
+			if a.Type != 1 {
+				continue
+			}
+			if ip := net.ParseIP(strings.TrimSpace(a.Data)); ip != nil && ip.To4() != nil {
+				ips = append(ips, ip.String())
+			}
+		}
+		if len(ips) > 0 {
+			return ips, nil
+		}
+		lastErr = fmt.Errorf("%s: 没有 A 记录 (Status=%d)", ep, dr.Status)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用的 DoH 接口")
+	}
+	return nil, lastErr
+}
+
+// newHTTPClient 返回一个优先用系统解析、失败后回退 DoH 的客户端。
+// 只对 hostname 生效; 直接写 IP 的地址不受影响。
+func newHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: cidrFetchTimeout, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		TLSHandshakeTimeout: cidrFetchTimeout,
+		ForceAttemptHTTP2:   true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil || net.ParseIP(host) != nil {
+				return dialer.DialContext(ctx, network, addr)
+			}
+
+			var reasons []string
+			// 系统解析最多等 2s; 遇到只说"不支持"或直接拒绝的环境 (android 纯静态
+			// 构建), 立刻转 DoH, 不把整个请求的超时耗在必然失败的查询上。
+			lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			ips, lookupErr := net.DefaultResolver.LookupHost(lookupCtx, host)
+			cancel()
+			if lookupErr == nil && len(ips) > 0 {
+				for _, ip := range ips {
+					if c, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port)); err == nil {
+						return c, nil
+					} else {
+						reasons = append(reasons, err.Error())
+					}
+				}
+			} else if lookupErr != nil {
+				reasons = append(reasons, "系统解析: "+lookupErr.Error())
+			}
+
+			ips, err = dohLookup(ctx, host)
+			if err != nil {
+				reasons = append(reasons, "DoH: "+err.Error())
+				return nil, fmt.Errorf("解析 %s 失败 (%s)", host, strings.Join(reasons, "; "))
+			}
+			for _, ip := range ips {
+				if c, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port)); err == nil {
+					return c, nil
+				} else {
+					reasons = append(reasons, err.Error())
+				}
+			}
+			return nil, fmt.Errorf("解析 %s 失败 (%s)", host, strings.Join(reasons, "; "))
+		},
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}
+}
+
+func fetchURL(rawURL string, timeout time.Duration) (string, error) {
+	client := newHTTPClient(timeout)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
 	}

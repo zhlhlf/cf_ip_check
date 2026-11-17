@@ -78,8 +78,13 @@
 | `-c` / `-rc` | 200 / 8 | 阶段 1 / 阶段 2 并发数 |
 | `-timeout` | 0 | 单次探测超时（毫秒）；0 = 按模式取默认，TCP 1s / TLS 2s / WS 2.2s |
 | `-verify` | false | 校验 TLS 证书（仅 TLS+WS 模式；默认跳过，系统 CA 过旧会误判） |
+| `-v` | false | 打印每个在线 CIDR 源的尝试结果和错误 |
 
 写回目标由 `cf.env` 的 `CLASH_YML` 决定，没有对应的命令行参数。
+
+在线 CIDR 列表依次尝试 GitHub 直连和几个镜像。解析域名时先用系统解析，
+失败则回退到 DoH (`223.5.5.5` / `1.1.1.1`，HTTP 请求走 IP 不需要 DNS)——
+纯静态的 android 构建没有 `/etc/resolv.conf`，只靠系统解析会立刻失败。
 
 ## cf.env
 
