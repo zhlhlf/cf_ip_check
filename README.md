@@ -2,7 +2,7 @@
 
 改造自 [zhlhlf/cf_ip_check](https://github.com/zhlhlf/cf_ip_check)。
 
-**所有配置都在 `cf.env` 里**，不读、也不改 xray 的 `config.json`。
+**所有配置都在 `.cfenv` 里**，不读、也不改 xray 的 `config.json`。
 
 ## 三种模式
 
@@ -51,14 +51,14 @@
 
 ## 用法
 
-`cf.env.example` 已内嵌进二进制：默认路径 `cf.env` 不存在时会自动生成一份模板，
+`.cfenv.example` 已内嵌进二进制：默认路径 `.cfenv` 不存在时会自动生成一份模板，
 改完再跑即可，不需要手动 `cp`。（显式指定的 `-env` 路径不存在仍会报错，避免路径写错时悄悄生成模板。）
 
 ```bash
-# 默认读当前目录的 cf.env, 不存在则自动从内置模板生成
+# 默认读当前目录的 .cfenv, 不存在则自动从内置模板生成
 ./cfip
 
-# 完整筛选 + 测速, 并按 cf.env 的 CLASH_YML 写回 clash 配置
+# 完整筛选 + 测速, 并按 .cfenv 的 CLASH_YML 写回 clash 配置
 ./cfip
 
 # 限定网段穷举
@@ -70,7 +70,7 @@
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `-env` | `cf.env` | 配置文件路径 |
+| `-env` | `.cfenv` | 配置文件路径 |
 | `-cidr` | | 限定网段，逗号分隔，覆盖在线列表 |
 | `-n` | 4096 | 抽样候选数 |
 | `-rounds` | 3 | 精测轮数 |
@@ -80,13 +80,13 @@
 | `-verify` | false | 校验 TLS 证书（仅 TLS+WS 模式；默认跳过，系统 CA 过旧会误判） |
 | `-v` | false | 打印每个在线 CIDR 源的尝试结果和错误 |
 
-写回目标由 `cf.env` 的 `CLASH_YML` 决定，没有对应的命令行参数。
+写回目标由 `.cfenv` 的 `CLASH_YML` 决定，没有对应的命令行参数。
 
 在线 CIDR 列表依次尝试 GitHub 直连和几个镜像。解析域名时先用系统解析，
 失败则回退到 DoH (`223.5.5.5` / `1.1.1.1`，HTTP 请求走 IP 不需要 DNS)——
 纯静态的 android 构建没有 `/etc/resolv.conf`，只靠系统解析会立刻失败。
 
-## cf.env
+## .cfenv
 
 ```ini
 # ---- 连接信息 ----
@@ -119,8 +119,8 @@ proxies:
 ```
 
 - 最终顺序：测速成功的按吞吐从高到低排前面，其余按握手排名补齐
-- **`server` 和 `port` 一起改**，都写成 `cf.env` 里的值。只换 IP 会很危险：探测是按
-  `cf.env` 的 `PORT` 做的，保留 yaml 里的旧端口等于把没验证过的 IP 塞进配置
+- **`server` 和 `port` 一起改**，都写成 `.cfenv` 里的值。只换 IP 会很危险：探测是按
+  `.cfenv` 的 `PORT` 做的，保留 yaml 里的旧端口等于把没验证过的 IP 塞进配置
 - `name`/`password`/`sni`/`ws-opts`/引号/注释全部原样保留
 - 只动 `proxies:` 段；`dns` 里同样叫 `server` 的字段不会被误改
 - 条目少于 16 个时全改并打印警告，不会静默跳过

@@ -63,10 +63,10 @@ jobs:
           # 容器已用 --user 身份运行, 正常情况下 dist 就属于当前用户;
           # 兜底处理旧产物遗留的 root 权限
           chown -R "$(id -u):$(id -g)" dist 2>/dev/null || true
-          # cf.env.example 已由 go:embed 编进二进制, 这里额外附一份方便直接查看
-          cp cf.env.example dist/cf.env.example
+          # .cfenv.example 已由 go:embed 编进二进制, 这里额外附一份方便直接查看
+          cp .cfenv.example dist/.cfenv.example
           cp README.md dist/README.md
-          cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* cf.env.example README.md && ls -lh
+          cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* .cfenv.example README.md && ls -lh
         env:
           SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
 
@@ -81,13 +81,13 @@ jobs:
             ## 使用方法
 
             1. 下载对应平台的 `cfip-<os>-<arch>`
-            2. 直接运行, 首次运行会自动生成 `cf.env`:
+            2. 直接运行, 首次运行会自动生成 `.cfenv`:
                ```bash
                chmod +x cfip-linux-amd64
                ./cfip-linux-amd64
                ```
                默认是纯 TCP 模式, 无需任何配置。
-            3. 编辑生成的 `cf.env`, 填写 `PASSWORD`、`HOST`、`PORT`、`XRAY_BIN`
+            3. 编辑生成的 `.cfenv`, 填写 `PASSWORD`、`HOST`、`PORT`、`XRAY_BIN`
                后重跑, 即切换到 TLS+WS 探测 + 隧道测速:
                ```bash
                ./cfip-linux-amd64
@@ -99,10 +99,10 @@ jobs:
                adb shell "/data/local/tmp/cfip-android-arm64 -version"
                ```
                Termux 里请改用 `cfip-linux-arm64`。
-            5. 想把结果写回 clash 配置, 在 `cf.env` 里设置 `CLASH_YML=/path/to/config.yml`,
+            5. 想把结果写回 clash 配置, 在 `.cfenv` 里设置 `CLASH_YML=/path/to/config.yml`,
                程序会改写该文件 `proxies` 段前 16 个节点的 IP。
 
-            `cf.env` 含节点密码, 已在 `.gitignore` 中忽略, 请勿提交。
+            `.cfenv` 含节点密码, 已在 `.gitignore` 中忽略, 请勿提交。
 
             版本: `${{ steps.vars.outputs.short_sha }}` (`./cfip -version` 可查看)
           files: |
@@ -110,6 +110,6 @@ jobs:
             dist/cfip-android-*
             dist/cfip-darwin-*
             dist/cfip-windows-*
-            dist/cf.env.example
+            dist/.cfenv.example
             dist/README.md
             dist/cfip-*.zip

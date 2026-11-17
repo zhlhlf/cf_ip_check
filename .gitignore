@@ -1,4 +1,5 @@
-# 本地配置 (含节点密码), 只提交 cf.env.example 模板
+# 本地配置 (含节点密码), 只提交 .cfenv.example 模板
+/.cfenv
 /cf.env
 
 # 编译产物

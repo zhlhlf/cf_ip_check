@@ -1,6 +1,6 @@
 // cfip 批量筛选 Cloudflare 优选 IP。
 //
-// 两种探测模式, 由 cf.env 里是否配置 PASSWORD 决定:
+// 两种探测模式, 由 .cfenv 里是否配置 PASSWORD 决定:
 //
 //   - 纯 TCP 模式 (PASSWORD 为空, 默认): 只做 TCP 三次握手。零配置即可运行,
 //     但 TCP 握手在 Cloudflare anycast 网络里几乎恒定为 70ms 左右, 只能筛掉
@@ -9,7 +9,7 @@
 //     Upgrade 101, 只有真正返回 101 的 IP 才算可用, 并可继续用 xray 隧道做
 //     真实吞吐测速。
 //
-// cf.env.example 已内嵌进二进制: 首次运行找不到 cf.env 时会自动生成一份。
+// .cfenv.example 已内嵌进二进制: 首次运行找不到 .cfenv 时会自动生成一份。
 package main
 
 import (
@@ -40,9 +40,9 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// envTemplate 是编译进二进制的配置模板, 首次运行时写到 cf.env。
+// envTemplate 是编译进二进制的配置模板, 首次运行时写到 .cfenv。
 //
-//go:embed cf.env.example
+//go:embed .cfenv.example
 var envTemplate []byte
 
 const (
@@ -169,15 +169,15 @@ func main() {
 		cidrFlag  = flag.String("cidr", "", "限定网段, 逗号分隔 (如 172.64.229.0/24), 覆盖在线列表")
 		noFetch   = flag.Bool("no-fetch", false, "不拉取在线 CIDR 列表, 只用内置网段")
 		verbose   = flag.Bool("v", false, "打印每个 CIDR 源的尝试结果与错误")
-		envFile   = flag.String("env", "cf.env", "配置文件, 内含 Host/端口/密码/测速参数")
+		envFile   = flag.String("env", ".cfenv", "配置文件, 内含 Host/端口/密码/测速参数")
 		showVer   = flag.Bool("version", false, "打印版本号后退出")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: %s [选项]\n\n", os.Args[0])
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
-所有连接参数 (Host/端口/路径/密码/xray 路径) 都在 cf.env 里配置。
-cf.env 不存在时会自动生成 (内置 cf.env.example)。
+所有连接参数 (Host/端口/路径/密码/xray 路径) 都在 .cfenv 里配置。
+.cfenv 不存在时会自动生成 (内置 .cfenv.example)。
 
 PASSWORD 为空 (默认) 时只做纯 TCP 探测; 配置 PASSWORD 后自动启用
 TLS+WS 握手探测和 xray 隧道测速。
@@ -195,10 +195,17 @@ TLS+WS 握手探测和 xray 隧道测速。
 		return
 	}
 
-	// ---- 读 cf.env: 连接参数 + 测速参数 ----
-	// 只有默认的 cf.env 会被自动创建; 显式指定的 -env 路径不存在仍报错,
+	// ---- 读 .cfenv: 连接参数 + 测速参数 ----
+	// 只有默认的 .cfenv 会被自动创建; 显式指定的 -env 路径不存在仍报错,
 	// 避免路径写错时悄悄生成一个模板。
-	conf, err := loadConfig(*envFile, filepath.Clean(*envFile) == "cf.env")
+	if filepath.Clean(*envFile) == ".cfenv" {
+		if _, err := os.Stat(".cfenv"); err != nil {
+			if _, oldErr := os.Stat("cf.env"); oldErr == nil {
+				fmt.Println("提示   发现旧配置 cf.env, 现在默认读 .cfenv, 改名即可: mv cf.env .cfenv")
+			}
+		}
+	}
+	conf, err := loadConfig(*envFile, filepath.Clean(*envFile) == ".cfenv")
 	if err != nil {
 		die("%v", err)
 	}
@@ -341,7 +348,7 @@ TLS+WS 握手探测和 xray 隧道测速。
 			ms(r.total), r.ok, r.tries)
 	}
 
-	// ---- 阶段 3: 真实吞吐测速 (可选, 由 cf.env 驱动) ----
+	// ---- 阶段 3: 真实吞吐测速 (可选, 由 .cfenv 驱动) ----
 	// 握手延迟只反映"连上 CF 边缘"的耗时, 不反映隧道内的实际转发能力:
 	// 同一个 /24 里出现过握手 230ms 的 IP 下载速度只有另一个的 1/4。
 	// 所以真正决定用哪个 IP 的必须是端到端吞吐。
@@ -354,7 +361,7 @@ TLS+WS 握手探测和 xray 隧道测速。
 		ordered = runSpeedStage(sp, final, conf, target)
 	}
 
-	// 写回: 只改 clash 配置里节点的 server 字段, 不动 cf.env 本身。
+	// 写回: 只改 clash 配置里节点的 server 字段, 不动 .cfenv 本身。
 	if conf.ClashYML != "" {
 		n, err := writeClashIPs(conf.ClashYML, ordered, clashIPCount, conf.Port)
 		if err != nil {
@@ -422,9 +429,9 @@ func score(r speedResult) float64 {
 	return r.mbps*10 - ms(r.firstByte)/100
 }
 
-// ---------------------------------------------------------------- cf.env
+// ---------------------------------------------------------------- .cfenv
 
-// speedProfile 是测速阶段的全部配置, 来自 cf.env。全空即表示"不测速"。
+// speedProfile 是测速阶段的全部配置, 来自 .cfenv。全空即表示"不测速"。
 type speedProfile struct {
 	URL     string
 	Top     int           // 参与测速的候选数
@@ -448,7 +455,7 @@ func envOverrides() map[string]string {
 	return out
 }
 
-// initConfig 在 cf.env 缺失时用内嵌模板创建它, 并返回解析结果。
+// initConfig 在 .cfenv 缺失时用内嵌模板创建它, 并返回解析结果。
 func initConfig(path string) (map[string]string, error) {
 	if err := os.WriteFile(path, envTemplate, 0o600); err != nil {
 		// 只读目录等场景: 不停机, 直接拿模板内容当默认配置。
@@ -674,7 +681,7 @@ func measureThroughput(ranks []rank, conf *cfConfig, t probeTarget, sp speedProf
 // checkXray 确认 xray 可执行文件存在。
 func checkXray(bin string) error {
 	if bin == "" {
-		return fmt.Errorf("cf.env 里没配 XRAY_BIN")
+		return fmt.Errorf(".cfenv 里没配 XRAY_BIN")
 	}
 	if !fileExists(bin) {
 		return fmt.Errorf("XRAY_BIN 指向的文件不存在: %s", bin)
@@ -762,7 +769,7 @@ func buildMinimalConfig(conf *cfConfig, ip string, t probeTarget, port int) []by
 	return b
 }
 
-// outbound 按 cf.env 里的参数生成一个完整的 outbound, address 用传入的候选 IP。
+// outbound 按 .cfenv 里的参数生成一个完整的 outbound, address 用传入的候选 IP。
 func (c *cfConfig) outbound(ip string) map[string]interface{} {
 	return map[string]interface{}{
 		"protocol": c.Protocol,
@@ -1149,9 +1156,9 @@ func ipToString(ip uint32) string {
 	return net.IPv4(byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip)).String()
 }
 
-// ---------------------------------------------------------------- cf.env 配置
+// ---------------------------------------------------------------- .cfenv 配置
 
-// cfConfig 是 cf.env 解析后的结果: 连接参数 + xray 路径 + 测速参数。
+// cfConfig 是 .cfenv 解析后的结果: 连接参数 + xray 路径 + 测速参数。
 type cfConfig struct {
 	// Host 同时是 TLS SNI 和 HTTP Host 头; 只有这一个域名参数。
 	Host     string
@@ -1229,9 +1236,9 @@ func (c *cfConfig) SpeedSkipReason() string {
 	return " (" + strings.Join(miss, ", ") + ")"
 }
 
-// loadConfig 读取 cf.env, 其余字段都有默认值。
+// loadConfig 读取 .cfenv, 其余字段都有默认值。
 //
-// create 为 true 且文件不存在时, 用内嵌的 cf.env.example 生成一份再读;
+// create 为 true 且文件不存在时, 用内嵌的 .cfenv.example 生成一份再读;
 // 写不出来 (比如当前目录只读) 则直接拿模板内容继续跑, 不阻塞纯 TCP 模式。
 func loadConfig(path string, create bool) (*cfConfig, error) {
 	vals, err := parseEnvFile(path)
@@ -1240,7 +1247,7 @@ func loadConfig(path string, create bool) (*cfConfig, error) {
 			return nil, fmt.Errorf("读取 %s 失败: %w", path, err)
 		}
 		if !create {
-			return nil, fmt.Errorf("配置文件不存在: %s (用默认 cf.env 运行会自动生成模板)", path)
+			return nil, fmt.Errorf("配置文件不存在: %s (用默认 .cfenv 运行会自动生成模板)", path)
 		}
 		vals, err = initConfig(path)
 		if err != nil {
@@ -1251,7 +1258,7 @@ func loadConfig(path string, create bool) (*cfConfig, error) {
 		vals[k] = v
 	}
 
-	// 旧版 cf.env 把 SNI 和 HOST 分成两个键。SNI 和 Host 在 WS 节点上必然是同一个
+	// 旧版配置把 SNI 和 HOST 分成两个键。SNI 和 Host 在 WS 节点上必然是同一个
 	// 域名, 现在只保留 HOST; 老配置里的 SNI 仍读一次作为回退, 避免升级后突然报缺 HOST。
 	c := &cfConfig{
 		Host:     vals["HOST"],
@@ -1378,7 +1385,7 @@ type clashEdit struct {
 // writeClashIPs 按顺序改写 clash 配置 proxies 段里前 n 个节点的 server IP 和 port,
 // 返回实际改写数量。
 //
-// server 和 port 必须一起改: 探测是按 cf.env 的 PORT 做的, 只换 IP 而保留 yaml 里
+// server 和 port 必须一起改: 探测是按 .cfenv 的 PORT 做的, 只换 IP 而保留 yaml 里
 // 的旧端口, 写进去的节点在旧端口上根本没验证过, 会变成一堆死节点。
 //
 // 其余内容 (name/password/sni/ws-opts/注释) 原样保留, 也不碰 proxies 段以外的同名键。
