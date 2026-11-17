@@ -63,8 +63,9 @@ jobs:
           # 容器已用 --user 身份运行, 正常情况下 dist 就属于当前用户;
           # 兜底处理旧产物遗留的 root 权限
           chown -R "$(id -u):$(id -g)" dist 2>/dev/null || true
-          # .cfenv.example 已由 go:embed 编进二进制, 这里额外附一份方便直接查看
-          cp .cfenv.example dist/.cfenv.example
+          # .cfenv.example 已由 go:embed 编进二进制, 这里额外附一份方便直接查看;
+          # 文件名不带前导点, 否则 release 资产会变成 default.cfenv.example
+          cp .cfenv.example dist/cfenv.example
           cp README.md dist/README.md
           cd dist && zip -q "cfip-${SHORT_SHA}.zip" cfip-* .cfenv.example README.md && ls -lh
         env:
@@ -110,6 +111,6 @@ jobs:
             dist/cfip-android-*
             dist/cfip-darwin-*
             dist/cfip-windows-*
-            dist/.cfenv.example
+            dist/cfenv.example
             dist/README.md
             dist/cfip-*.zip
